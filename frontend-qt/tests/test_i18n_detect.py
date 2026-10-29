@@ -37,7 +37,18 @@ class Detect(unittest.TestCase):
     def test_language_button_cycles_through_each_available_language(self):
         self.assertEqual(Lang.ZH.other, Lang.EN)
         self.assertEqual(Lang.EN.other, Lang.SV)
-        self.assertEqual(Lang.SV.other, Lang.ZH)
+        self.assertEqual(Lang.SV.other, Lang.DE)
+        self.assertEqual(Lang.DE.other, Lang.ZH)
+        self.assertEqual(Lang.SV.toggle_label, 'Deutsch')
+        self.assertEqual(Lang.DE.toggle_label, '中文')
+
+    def test_german_is_recognised_by_tag_and_windows_name(self):
+        for tag in ('de_DE', 'de-AT', 'de_CH.UTF-8', 'de'):
+            self.assertEqual(detect(tag), Lang.DE, tag)
+        self.assertEqual(detect('German_Germany', platform='win32'), Lang.DE)
+        self.assertEqual(detect('en_US', env={'NSPB_LANG': 'de'}), Lang.DE)
+        for tag in ('dv_MV', 'default'):   # not German
+            self.assertEqual(detect(tag), Lang.EN, tag)
 
     def test_a_saved_choice_wins(self):
         self.assertEqual(detect('English_United States', env={'NSPB_LANG': 'zh'}), Lang.ZH)
