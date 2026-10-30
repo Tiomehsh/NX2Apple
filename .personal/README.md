@@ -29,3 +29,5 @@ than attempting to apply the same changes twice. Automatic integration is not gu
 GitHub disables scheduled workflows in inactive public repositories after 60 days. Check the
 Actions page if scheduled runs stop; workflow_dispatch remains the manual entry point.
 No messages/issues are automatically posted and no game files, keys, saves or certificates are stored here.
+
+Revision 2 adds bounded device queries with a process deadline, remembers the device that successfully exposes the game container, and prevents concurrent refresh requests. Unprepared devices cannot block discovery indefinitely.

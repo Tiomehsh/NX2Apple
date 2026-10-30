@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 WORK = ROOT / '.personal-build'
 UPSTREAM = 'LNPANDY/NX2Apple'
 FORK = os.environ.get('GITHUB_REPOSITORY', 'Tiomehsh/NX2Apple')
-REVISION = 1
+REVISION = 2
 ASSET = 'NX2Apple-macOS-arm64.zip'
 
 
@@ -120,7 +120,7 @@ def package():
         raise ValueError(f'Expected an arm64 frontend, got {architecture}')
     shutil.copy2(binary, app / 'Contents/MacOS/NSPortBuilder')
     info['CFBundleShortVersionString'] = info['CFBundleVersion'] = state['version']
-    info['NX2ApplePersonalPatch'] = 'lcsign-save-sync-1'
+    info['NX2ApplePersonalPatch'] = f'lcsign-save-sync-{REVISION}'
     info['NX2AppleUpstreamCommit'] = state['upstream_commit']
     info_path.write_bytes(plistlib.dumps(info))
     run(['codesign', '--force', '--sign', '-', app])

@@ -1,6 +1,39 @@
 --- a/frontend/Sources/NSPortBuilder/SaveTransfer.swift
 +++ b/frontend/Sources/NSPortBuilder/SaveTransfer.swift
-@@ -20,7 +20,7 @@
+@@ -1,26 +1,38 @@
+ import AppKit
+ import SwiftUI
++import Darwin
+ 
+ /// `xcrun devicectl` for the save transfer, as one function: the tests hand in a stand-in, so no test ever reaches a device.
+ /// It takes devicectl's arguments and returns whether it exited 0 and what it printed.
+ struct DeviceControl {
+     let run: ([String]) -> (ok: Bool, output: String)
+ 
+-    static func xcrun(_ path: String) -> DeviceControl {
++    static func xcrun(_ path: String, queryTimeout: TimeInterval = 10) -> DeviceControl {
+         DeviceControl { args in
+             let p = Process(), out = Pipe()
+             p.executableURL = URL(fileURLWithPath: path)
+-            p.arguments = ["devicectl"] + args
++            let timeout: TimeInterval = args.starts(with: ["device", "copy"]) ? 120 : queryTimeout
++            p.arguments = ["devicectl", "--timeout", String(timeout)] + args
+             p.standardOutput = out; p.standardError = out; p.standardInput = FileHandle.nullDevice
+             do { try p.run() } catch { return (false, error.localizedDescription) }
++            // CoreDevice can stall on a paired device that has no usable developer connection.
++            // Its own deadline is backed by a process deadline, including a forced final stop.
++            let deadline = DispatchWorkItem {
++                if p.isRunning { p.terminate() }
++                DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
++                    if p.isRunning { kill(p.processIdentifier, SIGKILL) }
++                }
++            }
++            DispatchQueue.global().asyncAfter(deadline: .now() + timeout + 1, execute: deadline)
+             let data = out.fileHandleForReading.readDataToEndOfFile()
+             p.waitUntilExit()
++            deadline.cancel()
+             return (p.terminationStatus == 0, String(decoding: data, as: UTF8.self))
+         }
      }
  }
  
@@ -9,7 +42,7 @@
  /// the route the install takes (devicectl and the app's data container). The save that is replaced is backed up on the Mac
  /// first, so a copy in the wrong direction loses nothing.
  ///
-@@ -28,8 +28,8 @@
+@@ -28,8 +40,8 @@
  /// games/ (the launcher's layout), else in ~/Library/Application Support/nxnative/<title ID>/save (dm/mac/launcher.c, DM_SAVE;
  /// the device save is DM_SAVE + "_device", dm/host/hle_fs.c); the iPhone app in Documents/games/<title ID>/save (dm/ios/Sources/main.m), the per-game folder it uses when the
  /// game files come from Documents/games/<title ID>/, which is where the launcher's install puts them. A sideloaded IPA with
@@ -20,7 +53,7 @@
  struct SaveTransfer {
      /// The committed save folders (dm/host/hle_fs.c): `save`, and `save_device` for a game that mounts device save data beside
      /// its account save (Mario Kart 8 Deluxe). The `.work` and `.new` folders beside them are one session's uncommitted copy,
-@@ -68,7 +68,9 @@
+@@ -68,7 +80,9 @@
          guard !appPath.isEmpty else { return (legacy, nil) }
          let folder = URL(fileURLWithPath: appPath).deletingLastPathComponent()
          var isDir: ObjCBool = false
@@ -31,7 +64,7 @@
          return (folder.appendingPathComponent("save").appendingPathComponent(titleID), legacy)
      }
  
-@@ -89,6 +91,35 @@
+@@ -89,6 +103,35 @@
      }
  
      var deviceFolder: String { "Documents/games/\(titleID)" }
@@ -44,11 +77,11 @@
 +                  let result = root["result"] as? [String: Any], let files = result["files"] as? [[String: Any]] else { return [] }
 +            return Set(files.compactMap { ($0["name"] as? String)?.lowercased() })
 +        }
-+        let nested = try? list(deviceFolder, recurse: false)
-+        if let nested, !names(nested).isDisjoint(with: ["romfs.img", "romfs"]) { return deviceFolder }
 +        let documents = try list("Documents", recurse: false)
-+        if !names(documents).isDisjoint(with: ["save", "save_device", "romfs.img", "romfs"]) { return "Documents" }
-+        return nested == nil ? "Documents" : deviceFolder
++        let entries = names(documents)
++        if entries.contains("games"), let nested = try? list(deviceFolder, recurse: false),
++           !names(nested).isDisjoint(with: ["romfs.img", "romfs"]) { return deviceFolder }
++        return "Documents"
 +    }
 +
 +    /// An install receipt or a local signed app is not required to read a real container.
@@ -67,7 +100,7 @@
      /// Backups go beside the save, one folder per copy: "<date> mac" holds the Mac save a copy from the device replaced,
      /// "<date> device" the device save a copy from the Mac replaced.
      var backups: URL { macSave.deletingLastPathComponent().appendingPathComponent(macSave.lastPathComponent + "-backups") }
-@@ -106,10 +137,13 @@
+@@ -106,10 +149,13 @@
      /// Lists the game's folder on the device first: when that fails the device or the app cannot be reached, which is an
      /// error; a save folder that cannot be listed after it is one the app has not made yet.
      func readDevice() throws -> Contents {
@@ -83,7 +116,7 @@
              c.folders.append(f)
              if let date = entries.newest { c.newest = max(c.newest ?? date, date) }
          }
-@@ -130,14 +164,15 @@
+@@ -130,14 +176,15 @@
      /// fails leaves the Mac save as it was; then the Mac save moves into the backup and the copy takes its place.
      /// Returns the backup, nil when the Mac had no save.
      func deviceToMac() throws -> URL? {
@@ -101,7 +134,7 @@
          }
          var backup: URL?
          // A ~/Library save the app has not brought across yet stays where it is: macSave gets the copy, so the app keeps it
-@@ -155,15 +190,16 @@
+@@ -155,15 +202,16 @@
      func macToDevice() throws -> URL? {
          let here = readMac()
          guard !here.folders.isEmpty else { throw Failure.noMacSave }
@@ -121,7 +154,7 @@
              guard r.ok else { throw Failure.device(Self.lastLine(r.output)) }
          }
          return backup
-@@ -229,14 +265,17 @@
+@@ -229,14 +277,17 @@
          func walk(_ node: Any) {
              if let list = node as? [Any] { list.forEach(walk); return }
              guard let dict = node as? [String: Any] else { return }
@@ -142,7 +175,7 @@
          }
          walk(root)
          return (files, newest)
-@@ -310,19 +349,22 @@
+@@ -310,19 +361,22 @@
  
      enum DeviceState: Equatable { case notInstalled, reading, ready(SaveTransfer.Contents), failed(String) }
      @State private var macSave = SaveTransfer.Contents()
@@ -167,12 +200,36 @@
          return SaveTransfer(titleID: game.titleID, macSave: mac.save, legacySave: mac.legacy, device: game.installedDevice, bundle: bundle,
                              devicectl: devicectl ?? .xcrun(m.xcrunPath))
      }
-@@ -472,12 +514,18 @@
+@@ -419,6 +473,7 @@
+ 
+     /// The two copies, Refresh and the backups folder. A copy needs both sides readable and a save on the side it copies from.
+     private var actions: some View {
++        let reading = deviceState == .reading
+         let toDevice = !busy && deviceSave != nil && !macSave.folders.isEmpty
+         let toMac = !busy && !(deviceSave?.folders.isEmpty ?? true)
+         return HStack(spacing: 10) {
+@@ -427,8 +482,8 @@
+             Button(String(format: m.t("saves.toMac"), deviceName)) { ask(.mac) }.disabled(!toMac)
+                 .padTarget("saves.toMac", scope: "saves") { if toMac { ask(.mac) } }
+             Spacer(minLength: 8)
+-            Button(m.t("dev.refresh")) { refresh() }.disabled(busy)
+-                .padTarget("saves.refresh", scope: "saves") { if !busy { refresh() } }
++            Button(m.t("dev.refresh")) { refresh() }.disabled(busy || reading)
++                .padTarget("saves.refresh", scope: "saves") { if !busy && !reading { refresh() } }
+             if let transfer, FileManager.default.fileExists(atPath: transfer.backups.path) {
+                 Button(m.t("saves.backups")) { NSWorkspace.shared.open(transfer.backups) }
+                     .padTarget("saves.backups", scope: "saves") { NSWorkspace.shared.open(transfer.backups) }
+@@ -470,14 +525,23 @@
+     }
+ 
      private func refresh() {
-         guard let transfer, let game else { return }
+-        guard let transfer, let game else { return }
++        guard !busy, deviceState != .reading, let transfer, let game else { return }
          macSave = transfer.readMac()
 -        guard game.onDevice, !transfer.bundle.isEmpty else { deviceState = .notInstalled; return }
          deviceState = .reading
++        let deviceKey = "saveTransfer.device." + game.titleID
++        let preferred = UserDefaults.standard.string(forKey: deviceKey) ?? ""
 +        let remembered = game.installedDevice, selected = m.installDevice, known = m.devices, xcrun = m.xcrunPath
          DispatchQueue.global(qos: .userInitiated).async {
 -            let state: DeviceState
@@ -180,9 +237,10 @@
 -            DispatchQueue.main.async { deviceState = state }
 +            let devices = known.isEmpty ? DeviceTools.devices(xcrun: xcrun) : known
 +            do {
-+                let found = try SaveTransfer.discover(template: transfer, devices: [remembered, selected] + devices.filter(\.reachable).map(\.id))
++                let found = try SaveTransfer.discover(template: transfer, devices: [preferred, remembered, selected] + devices.filter(\.reachable).map(\.id))
 +                DispatchQueue.main.async {
 +                    connectedTransfer = found?.0
++                    if let found { UserDefaults.standard.set(found.0.device, forKey: deviceKey) }
 +                    connectedName = found.flatMap { found in devices.first { $0.id == found.0.device }?.name }
 +                    deviceState = found.map { .ready($0.1) } ?? .notInstalled
 +                }
@@ -201,7 +259,7 @@
          "saves.unreachable": ("无法读取：%@", "Cannot be read: %@"),
          "saves.newer": ("较新", "Newer"),
          "saves.toDevice": ("Mac → %@", "Mac → %@"),
-@@ -1145,7 +1145,7 @@
+@@ -1149,7 +1149,7 @@
          "saves.saved": "Sparad %@",
          "saves.none": "Ingen sparfil ännu",
          "saves.reading": "Läser …",
@@ -216,11 +274,11 @@
                      var files: [[String: Any]] = []
                      for case let url as URL in fm.enumerator(at: dir, includingPropertiesForKeys: nil)! {
                          let v = try! url.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey])
-+                        if args.contains("--no-recurse") && url.deletingLastPathComponent() != dir { continue }
++                        if args.contains("--no-recurse") && url.deletingLastPathComponent().resolvingSymlinksInPath().path != dir.resolvingSymlinksInPath().path { continue }
                          files.append(["name": url.lastPathComponent, "fileType": v.isDirectory! ? "directory" : "file",
                                        "modificationDate": iso.string(from: v.contentModificationDate!)])
                      }
-@@ -107,6 +108,16 @@
+@@ -107,6 +108,26 @@
          XCTAssertEqual(t.backups.path, library.path + "/save/" + titleID + "-backups")
      }
  
@@ -234,15 +292,23 @@
 +        XCTAssertNotNil(paths.legacy)
 +    }
 +
++    func testAnUnresponsiveDeviceCommandHasAProcessDeadline() throws {
++        let command = temporary.appendingPathComponent("unresponsive-xcrun")
++        try "#!/bin/sh\nexec /bin/sleep 30\n".write(to: command, atomically: true, encoding: .utf8)
++        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: command.path)
++        let started = Date()
++        let result = DeviceControl.xcrun(command.path, queryTimeout: 0.1).run(["device", "info", "files"])
++        XCTAssertFalse(result.ok)
++        XCTAssertLessThan(Date().timeIntervalSince(started), 5, "an unprepared iPad must not block discovery indefinitely")
++    }
++
      private let older = Date(timeIntervalSince1970: 1_700_000_000), newer = Date(timeIntervalSince1970: 1_760_000_000)
  
      func testTheMacSaveIsTheLaunchersFolderAndItsNewestFile() throws {
-@@ -139,6 +150,29 @@
-         XCTAssertThrowsError(try t.readDevice()) { error in
-             XCTAssertEqual(error as? SaveTransfer.Failure, .device("ERROR: The device is not connected. (com.apple.dt.CoreDeviceError error 4)"))
+@@ -141,9 +162,33 @@
          }
-+    }
-+
+     }
+ 
 +    func testSideloadedContainerWithoutLocalInstallReceiptCanBeDiscoveredAndCopied() throws {
 +        let device = FakeDevice(temporary.appendingPathComponent("container"))
 +        let template = setUp(device: device)
@@ -264,15 +330,28 @@
 +        let contents = try XCTUnwrap(SaveTransfer.parseListing(data))
 +        XCTAssertEqual(contents.files, 1)
 +        XCTAssertEqual(contents.newest, ISO8601DateFormatter().date(from: "2025-06-01T10:00:00Z"))
-     }
- 
++    }
++
      func testDeviceToMacBacksUpTheMacSaveAndReplacesIt() throws {
-@@ -217,7 +251,7 @@
-         device.reachable = false
+         let device = FakeDevice(temporary.appendingPathComponent("container"))
+         let t = setUp(device: device)
++        try write("img", device.container.appendingPathComponent("Documents/games/\(titleID)/romfs.img"), date: older)
+         try write("device save", device.container.appendingPathComponent("Documents/games/\(titleID)/save/data.bin"), date: newer)
+         try write("mac save", t.mac.appendingPathComponent("save/data.bin"), date: older)
+         try write("mac only", t.mac.appendingPathComponent("save/extra.bin"), date: older)
+@@ -200,6 +245,7 @@
+     func testMacToDeviceReplacesNothingWhenTheBackupFails() throws {
+         let device = FakeDevice(temporary.appendingPathComponent("container"))
+         let t = setUp(device: device)
++        try write("img", device.container.appendingPathComponent("Documents/games/\(titleID)/romfs.img"), date: older)
+         let game = device.container.appendingPathComponent("Documents/games/\(titleID)")
+         try write("device save", game.appendingPathComponent("save/data.bin"), date: older)
          try write("mac save", t.mac.appendingPathComponent("save/data.bin"), date: newer)
-         XCTAssertThrowsError(try t.macToDevice())
--        XCTAssertEqual(device.calls.count, 1)
-+        XCTAssertEqual(device.calls.count, 2)
-     }
- 
-     func testACopyNestedInItsDestinationIsTheSaveFolderAllTheSame() throws {
+@@ -224,6 +270,7 @@
+         let device = FakeDevice(temporary.appendingPathComponent("container"))
+         device.nested = true
+         let t = setUp(device: device)
++        try write("img", device.container.appendingPathComponent("Documents/games/\(titleID)/romfs.img"), date: older)
+         try write("device save", device.container.appendingPathComponent("Documents/games/\(titleID)/save/sub/data.bin"), date: newer)
+         _ = try t.deviceToMac()
+         XCTAssertEqual(read(t.mac.appendingPathComponent("save/sub/data.bin")), "device save")
