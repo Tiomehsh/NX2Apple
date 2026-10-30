@@ -1,3 +1,7 @@
+> Personal LCSign save-sync builds: [releases](https://github.com/Tiomehsh/NX2Apple/releases).
+> This fork automatically patches official release frontends; see [.personal/README.md](.personal/README.md).
+> Game build tools continue to follow LNPANDY/NX2Apple. The upstream documentation follows below.
+
 <div align="center">
 
 <picture>

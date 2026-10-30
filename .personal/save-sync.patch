@@ -1,0 +1,278 @@
+--- a/frontend/Sources/NSPortBuilder/SaveTransfer.swift
++++ b/frontend/Sources/NSPortBuilder/SaveTransfer.swift
+@@ -20,7 +20,7 @@
+     }
+ }
+ 
+-/// A game's save on this Mac and in the app the launcher installed on a paired iPhone or iPad (#66), copied either way over
++/// A game's save on this Mac and in its app on a paired iPhone or iPad (#66), copied either way over
+ /// the route the install takes (devicectl and the app's data container). The save that is replaced is backed up on the Mac
+ /// first, so a copy in the wrong direction loses nothing.
+ ///
+@@ -28,8 +28,8 @@
+ /// games/ (the launcher's layout), else in ~/Library/Application Support/nxnative/<title ID>/save (dm/mac/launcher.c, DM_SAVE;
+ /// the device save is DM_SAVE + "_device", dm/host/hle_fs.c); the iPhone app in Documents/games/<title ID>/save (dm/ios/Sources/main.m), the per-game folder it uses when the
+ /// game files come from Documents/games/<title ID>/, which is where the launcher's install puts them. A sideloaded IPA with
+-/// the game files inside keeps Documents/save instead, but the launcher knows the bundle ID (the data container) only of the
+-/// apps it installed, so those are the ones it copies to.
++/// the game files inside keeps Documents/save instead. Discovery probes the actual installed container even when the
++/// launcher's local installation receipt or signed app has been removed.
+ struct SaveTransfer {
+     /// The committed save folders (dm/host/hle_fs.c): `save`, and `save_device` for a game that mounts device save data beside
+     /// its account save (Mario Kart 8 Deluxe). The `.work` and `.new` folders beside them are one session's uncommitted copy,
+@@ -68,7 +68,9 @@
+         guard !appPath.isEmpty else { return (legacy, nil) }
+         let folder = URL(fileURLWithPath: appPath).deletingLastPathComponent()
+         var isDir: ObjCBool = false
+-        guard FileManager.default.fileExists(atPath: folder.appendingPathComponent("games").path, isDirectory: &isDir), isDir.boolValue else { return (legacy, nil) }
++        let marked = FileManager.default.fileExists(atPath: folder.appendingPathComponent(".nx2apple-library").path)
++        let oldLayout = FileManager.default.fileExists(atPath: folder.appendingPathComponent("games").path, isDirectory: &isDir) && isDir.boolValue
++        guard marked || oldLayout else { return (legacy, nil) }
+         return (folder.appendingPathComponent("save").appendingPathComponent(titleID), legacy)
+     }
+ 
+@@ -89,6 +91,35 @@
+     }
+ 
+     var deviceFolder: String { "Documents/games/\(titleID)" }
++
++    /// The runtime keeps legacy/sideloaded saves directly in Documents. A per-game folder
++    /// without resources is not active (main.m set_data_env), so do not copy into it.
++    private func activeDeviceFolder() throws -> String {
++        func names(_ data: Data) -> Set<String> {
++            guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
++                  let result = root["result"] as? [String: Any], let files = result["files"] as? [[String: Any]] else { return [] }
++            return Set(files.compactMap { ($0["name"] as? String)?.lowercased() })
++        }
++        let nested = try? list(deviceFolder, recurse: false)
++        if let nested, !names(nested).isDisjoint(with: ["romfs.img", "romfs"]) { return deviceFolder }
++        let documents = try list("Documents", recurse: false)
++        if !names(documents).isDisjoint(with: ["save", "save_device", "romfs.img", "romfs"]) { return "Documents" }
++        return nested == nil ? "Documents" : deviceFolder
++    }
++
++    /// An install receipt or a local signed app is not required to read a real container.
++    /// Try the remembered/selected device first, then the other connected paired devices.
++    static func discover(template: SaveTransfer, devices: [String]) throws -> (SaveTransfer, Contents)? {
++        var seen = Set<String>(), last: Error?
++        for id in devices where !id.isEmpty && seen.insert(id).inserted {
++            var candidate = SaveTransfer(titleID: template.titleID, macSave: template.macSave, legacySave: template.legacySave,
++                                         device: id, bundle: template.bundle, devicectl: template.devicectl)
++            candidate.scratch = template.scratch; candidate.now = template.now
++            do { return (candidate, try candidate.readDevice()) } catch { last = error }
++        }
++        if let last { throw last }
++        return nil
++    }
+     /// Backups go beside the save, one folder per copy: "<date> mac" holds the Mac save a copy from the device replaced,
+     /// "<date> device" the device save a copy from the Mac replaced.
+     var backups: URL { macSave.deletingLastPathComponent().appendingPathComponent(macSave.lastPathComponent + "-backups") }
+@@ -106,10 +137,13 @@
+     /// Lists the game's folder on the device first: when that fails the device or the app cannot be reached, which is an
+     /// error; a save folder that cannot be listed after it is one the app has not made yet.
+     func readDevice() throws -> Contents {
+-        _ = try list(deviceFolder, recurse: false)
++        try readDevice(at: activeDeviceFolder())
++    }
++
++    private func readDevice(at folder: String) throws -> Contents {
+         var c = Contents()
+         for f in Self.folders {
+-            guard let data = try? list(deviceFolder + "/" + f, recurse: true), let entries = Self.parseListing(data), entries.files > 0 else { continue }
++            guard let data = try? list(folder + "/" + f, recurse: true), let entries = Self.parseListing(data), entries.files > 0 else { continue }
+             c.folders.append(f)
+             if let date = entries.newest { c.newest = max(c.newest ?? date, date) }
+         }
+@@ -130,14 +164,15 @@
+     /// fails leaves the Mac save as it was; then the Mac save moves into the backup and the copy takes its place.
+     /// Returns the backup, nil when the Mac had no save.
+     func deviceToMac() throws -> URL? {
+-        let there = try readDevice()
++        let folder = try activeDeviceFolder()
++        let there = try readDevice(at: folder)
+         guard !there.folders.isEmpty else { throw Failure.noDeviceSave }
+         let fm = FileManager.default
+         let incoming = macSave.deletingLastPathComponent().appendingPathComponent(".save-incoming-\(UUID().uuidString)")
+         try fm.createDirectory(at: incoming, withIntermediateDirectories: true)
+         defer { try? fm.removeItem(at: incoming) }
+         for f in there.folders {
+-            try copyFrom(deviceFolder + "/" + f, to: incoming.appendingPathComponent(f))
++            try copyFrom(folder + "/" + f, to: incoming.appendingPathComponent(f))
+         }
+         var backup: URL?
+         // A ~/Library save the app has not brought across yet stays where it is: macSave gets the copy, so the app keeps it
+@@ -155,15 +190,16 @@
+     func macToDevice() throws -> URL? {
+         let here = readMac()
+         guard !here.folders.isEmpty else { throw Failure.noMacSave }
+-        let there = try readDevice()
++        let folder = try activeDeviceFolder()
++        let there = try readDevice(at: folder)
+         var backup: URL?
+         if !there.folders.isEmpty {
+             let into = try makeBackup("device")
+             backup = into
+-            for f in there.folders { try copyFrom(deviceFolder + "/" + f, to: into.appendingPathComponent(f)) }
++            for f in there.folders { try copyFrom(folder + "/" + f, to: into.appendingPathComponent(f)) }
+         }
+         for f in here.folders {
+-            let r = devicectl.run(Self.copyToCommand(device: device, bundle: bundle, source: (macSource(f) ?? Self.macPath(f, save: macSave)).path, destination: deviceFolder + "/" + f))
++            let r = devicectl.run(Self.copyToCommand(device: device, bundle: bundle, source: (macSource(f) ?? Self.macPath(f, save: macSave)).path, destination: folder + "/" + f))
+             guard r.ok else { throw Failure.device(Self.lastLine(r.output)) }
+         }
+         return backup
+@@ -229,14 +265,17 @@
+         func walk(_ node: Any) {
+             if let list = node as? [Any] { list.forEach(walk); return }
+             guard let dict = node as? [String: Any] else { return }
+-            if let raw = dict["modificationDate"] {
++            let metadata = dict["metadata"] as? [String: Any]
++            let resources = dict["resources"] as? [String: Any]
++            let raw = dict["modificationDate"] ?? metadata?["modificationDate"] ?? metadata?["lastModDate"]
++            if let raw {
+                 let kind = ["fileType", "type", "kind"].compactMap { dict[$0] as? String }.joined().lowercased()
+-                if !kind.contains("dir") {
++                if !kind.contains("dir") && resources?["isDirectory"] as? Bool != true {
+                     files += 1
+                     if let date = date(raw) { newest = max(newest ?? date, date) }
+                 }
+             }
+-            dict.values.forEach(walk)
++            for (key, value) in dict where key != "metadata" || raw == nil { walk(value) }
+         }
+         walk(root)
+         return (files, newest)
+@@ -310,19 +349,22 @@
+ 
+     enum DeviceState: Equatable { case notInstalled, reading, ready(SaveTransfer.Contents), failed(String) }
+     @State private var macSave = SaveTransfer.Contents()
++    @State private var connectedTransfer: SaveTransfer?
++    @State private var connectedName: String?
+     @State private var deviceState = DeviceState.notInstalled
+     @State private var asking: SaveTransfer.Side?   // the side whose save a copy would replace
+     @State private var busy = false
+     @State private var result: (text: String, ok: Bool)?
+ 
+     private var game: LibraryGame? { library.games.first { $0.id == gameID } }
+-    private var deviceName: String { game.map { m.deviceName($0.installedDevice) } ?? "iPhone" }
++    private var deviceName: String { connectedName ?? game.map { m.deviceName($0.installedDevice) } ?? "iPhone" }
+ 
+     private var transfer: SaveTransfer? {
++        if let connectedTransfer { return connectedTransfer }
+         guard let game else { return nil }
+         let mac = support.map { SaveTransfer.macSave(titleID: game.titleID, appPath: game.appPath, support: $0) }
+             ?? SaveTransfer.macSave(titleID: game.titleID, appPath: game.appPath)
+-        let bundle = NSDictionary(contentsOfFile: game.iosAppPath + "/Info.plist")?["CFBundleIdentifier"] as? String ?? ""
++        let bundle = NSDictionary(contentsOfFile: game.iosAppPath + "/Info.plist")?["CFBundleIdentifier"] as? String ?? "org.nxnative." + game.titleID.lowercased()
+         return SaveTransfer(titleID: game.titleID, macSave: mac.save, legacySave: mac.legacy, device: game.installedDevice, bundle: bundle,
+                             devicectl: devicectl ?? .xcrun(m.xcrunPath))
+     }
+@@ -472,12 +514,18 @@
+     private func refresh() {
+         guard let transfer, let game else { return }
+         macSave = transfer.readMac()
+-        guard game.onDevice, !transfer.bundle.isEmpty else { deviceState = .notInstalled; return }
+         deviceState = .reading
++        let remembered = game.installedDevice, selected = m.installDevice, known = m.devices, xcrun = m.xcrunPath
+         DispatchQueue.global(qos: .userInitiated).async {
+-            let state: DeviceState
+-            do { state = .ready(try transfer.readDevice()) } catch { state = .failed(message(error)) }
+-            DispatchQueue.main.async { deviceState = state }
++            let devices = known.isEmpty ? DeviceTools.devices(xcrun: xcrun) : known
++            do {
++                let found = try SaveTransfer.discover(template: transfer, devices: [remembered, selected] + devices.filter(\.reachable).map(\.id))
++                DispatchQueue.main.async {
++                    connectedTransfer = found?.0
++                    connectedName = found.flatMap { found in devices.first { $0.id == found.0.device }?.name }
++                    deviceState = found.map { .ready($0.1) } ?? .notInstalled
++                }
++            } catch { DispatchQueue.main.async { deviceState = .failed(message(error)) } }
+         }
+     }
+ 
+--- a/frontend/Sources/NSPortBuilder/Localization.swift
++++ b/frontend/Sources/NSPortBuilder/Localization.swift
+@@ -277,7 +277,7 @@
+         "saves.saved": ("保存于 %@", "Saved %@"),
+         "saves.none": ("还没有存档", "No save yet"),
+         "saves.reading": ("正在读取…", "Reading…"),
+-        "saves.notInstalled": ("这个游戏没有从这里安装到 iPhone 或 iPad。在“构建”页面选择设备和签名团队安装后，就可以在这里复制存档。", "This game was not installed on an iPhone or iPad from here. Install it from the Builds page (a device and a signing team), then its save can be copied here."),
++        "saves.notInstalled": ("请连接并解锁已安装此游戏的 iPhone 或 iPad，然后刷新。", "Connect and unlock the iPhone or iPad with this game installed, then refresh."),
+         "saves.unreachable": ("无法读取：%@", "Cannot be read: %@"),
+         "saves.newer": ("较新", "Newer"),
+         "saves.toDevice": ("Mac → %@", "Mac → %@"),
+@@ -1145,7 +1145,7 @@
+         "saves.saved": "Sparad %@",
+         "saves.none": "Ingen sparfil ännu",
+         "saves.reading": "Läser …",
+-        "saves.notInstalled": "Det här spelet har inte installerats på en iPhone eller iPad härifrån. Installera det från sidan Byggen med en enhet och ett signeringsteam. Därefter kan sparfilen kopieras hit.",
++        "saves.notInstalled": "Anslut och lås upp den iPhone eller iPad där spelet är installerat och uppdatera sedan.",
+         "saves.unreachable": "Kan inte läsas: %@",
+         "saves.newer": "Nyare",
+         "saves.toDevice": "Mac → %@",
+--- a/frontend/Tests/NSPortBuilderTests/SaveTransferTests.swift
++++ b/frontend/Tests/NSPortBuilderTests/SaveTransferTests.swift
+@@ -39,6 +39,7 @@
+                     var files: [[String: Any]] = []
+                     for case let url as URL in fm.enumerator(at: dir, includingPropertiesForKeys: nil)! {
+                         let v = try! url.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey])
++                        if args.contains("--no-recurse") && url.deletingLastPathComponent() != dir { continue }
+                         files.append(["name": url.lastPathComponent, "fileType": v.isDirectory! ? "directory" : "file",
+                                       "modificationDate": iso.string(from: v.contentModificationDate!)])
+                     }
+@@ -107,6 +108,16 @@
+         XCTAssertEqual(t.backups.path, library.path + "/save/" + titleID + "-backups")
+     }
+ 
++    func testMarkerOnlyLibraryUsesTheSameSaveAsTheMacRuntime() throws {
++        let library = temporary.appendingPathComponent("MarkerLibrary")
++        let app = library.appendingPathComponent("\(titleID).app")
++        try fm.createDirectory(at: app, withIntermediateDirectories: true)
++        try Data().write(to: library.appendingPathComponent(".nx2apple-library"))
++        let paths = SaveTransfer.macSave(titleID: titleID, appPath: app.path, support: temporary)
++        XCTAssertEqual(paths.save.path, library.path + "/save/" + titleID)
++        XCTAssertNotNil(paths.legacy)
++    }
++
+     private let older = Date(timeIntervalSince1970: 1_700_000_000), newer = Date(timeIntervalSince1970: 1_760_000_000)
+ 
+     func testTheMacSaveIsTheLaunchersFolderAndItsNewestFile() throws {
+@@ -139,6 +150,29 @@
+         XCTAssertThrowsError(try t.readDevice()) { error in
+             XCTAssertEqual(error as? SaveTransfer.Failure, .device("ERROR: The device is not connected. (com.apple.dt.CoreDeviceError error 4)"))
+         }
++    }
++
++    func testSideloadedContainerWithoutLocalInstallReceiptCanBeDiscoveredAndCopied() throws {
++        let device = FakeDevice(temporary.appendingPathComponent("container"))
++        let template = setUp(device: device)
++        let documents = device.container.appendingPathComponent("Documents")
++        try write("legacy save", documents.appendingPathComponent("save/SYSTEM/SYSTEM.DAT"), date: newer)
++        let found = try XCTUnwrap(try SaveTransfer.discover(template: template, devices: ["", "connected-phone"]))
++        XCTAssertEqual(found.0.device, "connected-phone")
++        XCTAssertEqual(found.1.folders, ["save"])
++        _ = try found.0.deviceToMac()
++        XCTAssertEqual(read(template.macSave.appendingPathComponent("SYSTEM/SYSTEM.DAT")), "legacy save")
++        try write("updated save", template.macSave.appendingPathComponent("SYSTEM/SYSTEM.DAT"), date: newer)
++        _ = try found.0.macToDevice()
++        XCTAssertEqual(read(documents.appendingPathComponent("save/SYSTEM/SYSTEM.DAT")), "updated save")
++        XCTAssertFalse(fm.fileExists(atPath: documents.appendingPathComponent("games/\(titleID)/save").path))
++    }
++
++    func testCurrentCoreDeviceMetadataDoesNotCountDirectoriesAsFiles() throws {
++        let data = Data(#"{"result":{"files":[{"name":"SYSTEM","resources":{"isDirectory":true},"metadata":{"lastModDate":"2030-01-01T00:00:00Z"}},{"name":"SYSTEM.DAT","resources":{"isDirectory":false},"metadata":{"lastModDate":"2025-06-01T10:00:00Z","size":560}}]}}"#.utf8)
++        let contents = try XCTUnwrap(SaveTransfer.parseListing(data))
++        XCTAssertEqual(contents.files, 1)
++        XCTAssertEqual(contents.newest, ISO8601DateFormatter().date(from: "2025-06-01T10:00:00Z"))
+     }
+ 
+     func testDeviceToMacBacksUpTheMacSaveAndReplacesIt() throws {
+@@ -217,7 +251,7 @@
+         device.reachable = false
+         try write("mac save", t.mac.appendingPathComponent("save/data.bin"), date: newer)
+         XCTAssertThrowsError(try t.macToDevice())
+-        XCTAssertEqual(device.calls.count, 1)
++        XCTAssertEqual(device.calls.count, 2)
+     }
+ 
+     func testACopyNestedInItsDestinationIsTheSaveFolderAllTheSame() throws {

@@ -35,3 +35,6 @@ frontend/NX2Apple.app/
 
 # the virtual environment the README creates for the Python packages
 .venv/
+
+# Personal release staging
+.personal-build/

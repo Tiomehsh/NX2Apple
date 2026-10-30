@@ -1,0 +1,40 @@
+name: Personal LCSign sync release
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: personal-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Check official release and apply personal patches
+        id: prepare
+        run: python3 .personal/release.py prepare
+      - name: Test save synchronization and updater
+        if: steps.prepare.outputs.build == 'yes'
+        working-directory: .personal-build/frontend
+        run: swift test --filter 'SaveTransferTests|AppUpdateTests'
+      - name: Build native frontend
+        if: steps.prepare.outputs.build == 'yes'
+        working-directory: .personal-build/frontend
+        run: swift build -c release
+      - name: Assemble and verify the app
+        if: steps.prepare.outputs.build == 'yes'
+        run: python3 .personal/release.py package
+      - name: Publish verified personal release
+        if: steps.prepare.outputs.build == 'yes'
+        run: python3 .personal/release.py publish
+
