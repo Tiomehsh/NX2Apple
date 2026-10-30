@@ -17,7 +17,7 @@
              p.executableURL = URL(fileURLWithPath: path)
 -            p.arguments = ["devicectl"] + args
 +            let timeout: TimeInterval = args.starts(with: ["device", "copy"]) ? 120 : queryTimeout
-+            p.arguments = ["devicectl", "--timeout", String(timeout)] + args
++            p.arguments = ["devicectl", "--timeout", String(Int(timeout.rounded(.up)))] + args
              p.standardOutput = out; p.standardError = out; p.standardInput = FileHandle.nullDevice
              do { try p.run() } catch { return (false, error.localizedDescription) }
 +            // CoreDevice can stall on a paired device that has no usable developer connection.
